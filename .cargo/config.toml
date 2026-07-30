@@ -1,0 +1,38 @@
+[alias]
+xtask = "run --package affix-xtask --"
+
+[unstable]
+profile-rustflags = true
+trim-paths = true
+
+[profile.release]
+trim-paths = "all"
+rustflags = [
+    "-Cjump-tables=no",
+    "-Zlocation-detail=none",
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-Cjump-tables=no",
+    "-Zlocation-detail=none",
+    "-Clink-arg=/DEBUG:NONE",
+    "-Ctarget-cpu=x86-64-v3",
+    "-Ctarget-feature=+crt-static,+avx2,+fma",
+    "-Ccontrol-flow-guard=yes",
+    "-Clink-arg=/DYNAMICBASE",
+    "-Clink-arg=/HIGHENTROPYVA",
+    "-Clink-arg=/NXCOMPAT",
+]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = [
+    "-Cjump-tables=no",
+    "-Zlocation-detail=none",
+    "-Clink-arg=/DEBUG:NONE",
+    "-Ctarget-feature=+crt-static,+neon",
+    "-Ccontrol-flow-guard=yes",
+    "-Clink-arg=/DYNAMICBASE",
+    "-Clink-arg=/HIGHENTROPYVA",
+    "-Clink-arg=/NXCOMPAT",
+]

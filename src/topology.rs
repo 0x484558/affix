@@ -1,0 +1,567 @@
+use std::collections::BTreeMap;
+#[cfg(windows)]
+use std::mem::size_of;
+use std::thread;
+use tracing::warn;
+#[cfg(windows)]
+use windows::Win32::Foundation::GetLastError;
+#[cfg(windows)]
+use windows_sys::Win32::System::SystemInformation::{
+    CacheUnified, CpuSetInformation, GROUP_AFFINITY, GetLogicalProcessorInformationEx,
+    GetSystemCpuSetInformation, RelationCache, SYSTEM_CPU_SET_INFORMATION,
+    SYSTEM_CPU_SET_INFORMATION_ALLOCATED, SYSTEM_CPU_SET_INFORMATION_ALLOCATED_TO_TARGET_PROCESS,
+    SYSTEM_CPU_SET_INFORMATION_PARKED, SYSTEM_CPU_SET_INFORMATION_REALTIME,
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CpuSetEntry {
+    pub id: u32,
+    pub group: u16,
+    pub logical_index: usize,
+    pub core_index: usize,
+    pub last_level_cache_index: usize,
+    pub numa_node: usize,
+    pub efficiency_class: u8,
+    pub cache: bool,
+    pub parked: bool,
+    pub allocated_to_other: bool,
+    pub realtime: bool,
+}
+
+pub struct CpuTopology {
+    pub entries: Vec<CpuSetEntry>,
+}
+
+impl CpuTopology {
+    pub fn read_or_fallback() -> Result<Self, String> {
+        match read_cpu_sets() {
+            Ok(entries) if !entries.is_empty() => Ok(Self { entries }),
+            Ok(_) => Ok(Self {
+                entries: fallback_logical_entries(),
+            }),
+            Err(err) => {
+                warn!(error = %err, "falling back to homogeneous CPU topology");
+                Ok(Self {
+                    entries: fallback_logical_entries(),
+                })
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn read_cpu_sets() -> Result<Vec<CpuSetEntry>, String> {
+    let mut returned_length = 0u32;
+    let ok = unsafe {
+        GetSystemCpuSetInformation(
+            std::ptr::null_mut(),
+            0,
+            &mut returned_length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok != 0 || returned_length == 0 {
+        return Err(
+            "GetSystemCpuSetInformation did not report a required buffer length".to_string(),
+        );
+    }
+
+    let mut buffer = vec![0u8; returned_length as usize];
+    let ok = unsafe {
+        GetSystemCpuSetInformation(
+            buffer.as_mut_ptr() as *mut SYSTEM_CPU_SET_INFORMATION,
+            returned_length,
+            &mut returned_length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "GetSystemCpuSetInformation failed with Windows error {}",
+            unsafe { GetLastError().0 }
+        ));
+    }
+
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    while offset + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= returned_length as usize {
+        let info = unsafe { &*(buffer.as_ptr().add(offset) as *const SYSTEM_CPU_SET_INFORMATION) };
+        if info.Size == 0 {
+            return Err("GetSystemCpuSetInformation returned a zero-sized entry".to_string());
+        }
+        if info.Type == CpuSetInformation {
+            let cpu_set = unsafe { info.Anonymous.CpuSet };
+            let flags = unsafe { cpu_set.Anonymous1.AllFlags };
+            let allocated = flags & SYSTEM_CPU_SET_INFORMATION_ALLOCATED as u8 != 0;
+            let allocated_to_target =
+                flags & SYSTEM_CPU_SET_INFORMATION_ALLOCATED_TO_TARGET_PROCESS as u8 != 0;
+            let logical_index = cpu_set.LogicalProcessorIndex as usize;
+            if cpu_set.Group == 0 && logical_index >= usize::BITS as usize {
+                return Err(format!(
+                    "logical processor index {logical_index} cannot fit in process affinity mask"
+                ));
+            }
+            entries.push(CpuSetEntry {
+                id: cpu_set.Id,
+                group: cpu_set.Group,
+                logical_index,
+                core_index: cpu_set.CoreIndex as usize,
+                last_level_cache_index: cpu_set.LastLevelCacheIndex as usize,
+                numa_node: cpu_set.NumaNodeIndex as usize,
+                efficiency_class: cpu_set.EfficiencyClass,
+                cache: false,
+                parked: flags & SYSTEM_CPU_SET_INFORMATION_PARKED as u8 != 0,
+                allocated_to_other: allocated && !allocated_to_target,
+                realtime: flags & SYSTEM_CPU_SET_INFORMATION_REALTIME as u8 != 0,
+            });
+        }
+        offset += info.Size as usize;
+    }
+
+    let c_caches = match detect_c_cache_affinities() {
+        Ok(caches) => caches,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to read C cache topology; treating C selector as unavailable"
+            );
+            Vec::new()
+        }
+    };
+    for entry in &mut entries {
+        entry.cache = c_caches
+            .iter()
+            .any(|cache| cache.contains(entry.group, entry.logical_index));
+    }
+
+    entries.sort_by_key(|entry| (entry.logical_index, entry.id));
+    Ok(entries)
+}
+
+pub fn fallback_logical_entries() -> Vec<CpuSetEntry> {
+    let count = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    (0..count)
+        .map(|index| CpuSetEntry {
+            id: index as u32,
+            group: 0,
+            logical_index: index,
+            core_index: index,
+            last_level_cache_index: 0,
+            numa_node: 0,
+            efficiency_class: 0,
+            cache: false,
+            parked: false,
+            allocated_to_other: false,
+            realtime: false,
+        })
+        .collect()
+}
+
+pub fn efficiency_classes(entries: &[&CpuSetEntry]) -> Vec<u8> {
+    let mut classes: Vec<u8> = entries.iter().map(|entry| entry.efficiency_class).collect();
+    classes.sort_unstable();
+    classes.dedup();
+    classes
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L3CacheAffinity {
+    pub group: u16,
+    pub mask: usize,
+    pub cache_size: u32,
+}
+
+impl L3CacheAffinity {
+    pub fn contains(&self, group: u16, logical_index: usize) -> bool {
+        group == self.group
+            && logical_index < usize::BITS as usize
+            && (self.mask & (1usize << logical_index)) != 0
+    }
+
+    pub fn processor_count(&self) -> u32 {
+        self.mask.count_ones()
+    }
+
+    pub fn lowest_logical_index(&self) -> u32 {
+        self.mask.trailing_zeros()
+    }
+}
+
+pub fn detect_c_cache_affinities() -> Result<Vec<L3CacheAffinity>, String> {
+    let l3_caches = read_l3_cache_affinities()?;
+    if !is_c_cache_candidate(&l3_caches) {
+        return Ok(Vec::new());
+    }
+
+    Ok(select_c_l3_cache_affinities(&l3_caches))
+}
+
+pub fn is_c_cache_candidate(caches: &[L3CacheAffinity]) -> bool {
+    if is_amd_x3d_cache_candidate_processor() {
+        return true;
+    }
+    // For non-AMD systems, detect if there is a "large cache like unique CCD"
+    // meaning asymmetrical L3 cache sizes where one CCD/core group has a strictly larger L3 cache size.
+    let sizes: Vec<u32> = caches
+        .iter()
+        .filter(|c| c.cache_size > 0 && c.mask != 0)
+        .map(|c| c.cache_size)
+        .collect();
+    if sizes.len() > 1 {
+        let max = *sizes.iter().max().unwrap_or(&0);
+        let min = *sizes.iter().min().unwrap_or(&0);
+        max > min
+    } else {
+        false
+    }
+}
+
+pub fn select_c_l3_cache_affinities(caches: &[L3CacheAffinity]) -> Vec<L3CacheAffinity> {
+    let Some(cache) = caches
+        .iter()
+        .copied()
+        .filter(|cache| cache.cache_size != 0 && cache.mask != 0)
+        .max_by_key(|cache| {
+            (
+                cache.cache_size,
+                cache.processor_count(),
+                std::cmp::Reverse(cache.group),
+                std::cmp::Reverse(cache.lowest_logical_index()),
+            )
+        })
+    else {
+        return Vec::new();
+    };
+
+    vec![cache]
+}
+
+#[cfg(windows)]
+pub fn read_l3_cache_affinities() -> Result<Vec<L3CacheAffinity>, String> {
+    let mut returned_length = 0u32;
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(RelationCache, std::ptr::null_mut(), &mut returned_length)
+    };
+    if ok != 0 || returned_length == 0 {
+        return Err(
+            "GetLogicalProcessorInformationEx(RelationCache) did not report a required buffer length"
+                .to_string(),
+        );
+    }
+
+    let mut buffer = vec![0u8; returned_length as usize];
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationCache,
+            buffer.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+            &mut returned_length,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "GetLogicalProcessorInformationEx(RelationCache) failed with Windows error {}",
+            unsafe { GetLastError().0 }
+        ));
+    }
+
+    let mut caches = Vec::new();
+    let mut offset = 0usize;
+    while offset < returned_length as usize {
+        if offset + size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>() > returned_length as usize
+        {
+            return Err(
+                "GetLogicalProcessorInformationEx(RelationCache) returned a truncated entry"
+                    .to_string(),
+            );
+        }
+
+        let info = unsafe {
+            &*(buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
+        };
+        if info.Size == 0 {
+            return Err(
+                "GetLogicalProcessorInformationEx(RelationCache) returned a zero-sized entry"
+                    .to_string(),
+            );
+        }
+        if offset + info.Size as usize > returned_length as usize {
+            return Err(
+                "GetLogicalProcessorInformationEx(RelationCache) entry exceeds returned buffer"
+                    .to_string(),
+            );
+        }
+
+        if info.Relationship == RelationCache {
+            let cache = unsafe { &info.Anonymous.Cache };
+            if cache.Level == 3 && cache.Type == CacheUnified {
+                let group_count = cache.GroupCount as usize;
+                let expected_size = size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()
+                    + group_count
+                        .saturating_sub(1)
+                        .saturating_mul(size_of::<GROUP_AFFINITY>());
+                if group_count == 0 || (info.Size as usize) < expected_size {
+                    return Err(
+                        "GetLogicalProcessorInformationEx(RelationCache) returned an invalid cache group count"
+                            .to_string(),
+                    );
+                }
+
+                let group_masks = unsafe { cache.Anonymous.GroupMasks.as_ptr() };
+                for index in 0..group_count {
+                    let group_mask = unsafe { *group_masks.add(index) };
+                    if group_mask.Mask != 0 {
+                        caches.push(L3CacheAffinity {
+                            group: group_mask.Group,
+                            mask: group_mask.Mask,
+                            cache_size: cache.CacheSize,
+                        });
+                    }
+                }
+            }
+        }
+
+        offset += info.Size as usize;
+    }
+
+    Ok(caches)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn is_amd_x3d_cache_candidate_processor() -> bool {
+    let Some((vendor, display_family, brand)) = x86_processor_identity() else {
+        return false;
+    };
+
+    vendor == *b"AuthenticAMD"
+        && matches!(display_family, 0x19 | 0x1a)
+        && processor_brand_contains_x3d(&brand)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn is_amd_x3d_cache_candidate_processor() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_processor_identity() -> Option<([u8; 12], u32, [u8; 48])> {
+    use std::arch::x86_64::__cpuid;
+
+    let leaf0 = __cpuid(0);
+    if leaf0.eax < 1 {
+        return None;
+    }
+
+    let mut vendor = [0u8; 12];
+    vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
+    vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
+    vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
+
+    let leaf1 = __cpuid(1);
+    let brand = read_x86_processor_brand()?;
+    Some((vendor, display_family_from_cpuid_eax(leaf1.eax), brand))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_x86_processor_brand() -> Option<[u8; 48]> {
+    use std::arch::x86_64::__cpuid;
+
+    let max_extended_leaf = __cpuid(0x8000_0000).eax;
+    if max_extended_leaf < 0x8000_0004 {
+        return None;
+    }
+
+    let mut brand = [0u8; 48];
+    for (index, leaf) in (0x8000_0002..=0x8000_0004).enumerate() {
+        let result = __cpuid(leaf);
+        let offset = index * 16;
+        brand[offset..offset + 4].copy_from_slice(&result.eax.to_le_bytes());
+        brand[offset + 4..offset + 8].copy_from_slice(&result.ebx.to_le_bytes());
+        brand[offset + 8..offset + 12].copy_from_slice(&result.ecx.to_le_bytes());
+        brand[offset + 12..offset + 16].copy_from_slice(&result.edx.to_le_bytes());
+    }
+
+    Some(brand)
+}
+
+pub fn processor_brand_contains_x3d(brand: &[u8]) -> bool {
+    String::from_utf8_lossy(brand)
+        .to_ascii_uppercase()
+        .contains("X3D")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn display_family_from_cpuid_eax(eax: u32) -> u32 {
+    let base_family = (eax >> 8) & 0x0f;
+    let extended_family = (eax >> 20) & 0xff;
+    if base_family == 0x0f {
+        base_family + extended_family
+    } else {
+        base_family
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CpuIslandKey {
+    pub group: u16,
+    pub numa_node: usize,
+    pub last_level_cache_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuIslandCandidate {
+    pub key: CpuIslandKey,
+    pub count: usize,
+    pub max_logical_index: usize,
+    pub shares_with_higher_efficiency: bool,
+}
+
+pub fn cpu_island_key(entry: &CpuSetEntry) -> CpuIslandKey {
+    CpuIslandKey {
+        group: entry.group,
+        numa_node: entry.numa_node,
+        last_level_cache_index: entry.last_level_cache_index,
+    }
+}
+
+pub fn choose_efficiency_island(
+    efficient_candidates: &[&CpuSetEntry],
+    higher_efficiency_pool: &[&CpuSetEntry],
+) -> Option<CpuIslandCandidate> {
+    let mut islands: BTreeMap<CpuIslandKey, CpuIslandCandidate> = BTreeMap::new();
+    for entry in efficient_candidates {
+        let key = cpu_island_key(entry);
+        let island = islands.entry(key).or_insert(CpuIslandCandidate {
+            key,
+            count: 0,
+            max_logical_index: 0,
+            shares_with_higher_efficiency: false,
+        });
+        island.count += 1;
+        island.max_logical_index = island.max_logical_index.max(entry.logical_index);
+    }
+
+    for entry in higher_efficiency_pool {
+        if let Some(island) = islands.get_mut(&cpu_island_key(entry)) {
+            island.shares_with_higher_efficiency = true;
+        }
+    }
+
+    if islands.len() <= 1 {
+        return None;
+    }
+
+    islands.values().copied().max_by_key(|island| {
+        (
+            !island.shares_with_higher_efficiency,
+            island.max_logical_index,
+            island.count,
+            std::cmp::Reverse(island.key),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn c_cache_selection_uses_one_preferred_windows_l3_cache_relationship() {
+        let caches = vec![
+            L3CacheAffinity {
+                group: 0,
+                mask: 0x000f,
+                cache_size: 32 * 1024 * 1024,
+            },
+            L3CacheAffinity {
+                group: 0,
+                mask: 0x00f0,
+                cache_size: 96 * 1024 * 1024,
+            },
+            L3CacheAffinity {
+                group: 0,
+                mask: 0x0f00,
+                cache_size: 128 * 1024 * 1024,
+            },
+            L3CacheAffinity {
+                group: 0,
+                mask: 0xf000,
+                cache_size: 128 * 1024 * 1024,
+            },
+        ];
+
+        assert_eq!(
+            select_c_l3_cache_affinities(&caches),
+            vec![L3CacheAffinity {
+                group: 0,
+                mask: 0x0f00,
+                cache_size: 128 * 1024 * 1024,
+            }]
+        );
+    }
+
+    #[test]
+    fn c_cache_selection_collapses_homogeneous_l3_topology_to_one_ccd() {
+        let caches = vec![
+            L3CacheAffinity {
+                group: 0,
+                mask: 0x00ff,
+                cache_size: 128 * 1024 * 1024,
+            },
+            L3CacheAffinity {
+                group: 0,
+                mask: 0xff00,
+                cache_size: 128 * 1024 * 1024,
+            },
+        ];
+
+        assert_eq!(
+            select_c_l3_cache_affinities(&caches),
+            vec![L3CacheAffinity {
+                group: 0,
+                mask: 0x00ff,
+                cache_size: 128 * 1024 * 1024,
+            }]
+        );
+    }
+
+    #[test]
+    fn l3_cache_affinity_contains_only_processors_in_its_group_mask() {
+        let cache = L3CacheAffinity {
+            group: 1,
+            mask: 0b1010,
+            cache_size: 96 * 1024 * 1024,
+        };
+
+        assert!(!cache.contains(0, 1));
+        assert!(cache.contains(1, 1));
+        assert!(!cache.contains(1, 2));
+        assert!(cache.contains(1, 3));
+        assert!(!cache.contains(1, usize::BITS as usize));
+    }
+
+    #[test]
+    fn x3d_processor_brand_gate_matches_9955hx3d_suffix() {
+        assert!(processor_brand_contains_x3d(
+            b"AMD Ryzen 9 9955HX3D 16-Core Processor"
+        ));
+        assert!(processor_brand_contains_x3d(
+            b"AMD Ryzen 9 7950X3D 16-Core Processor"
+        ));
+        assert!(!processor_brand_contains_x3d(
+            b"AMD Ryzen 9 9955HX 16-Core Processor"
+        ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpuid_display_family_decodes_extended_amd_family() {
+        let eax = (0x0f << 8) | (0x0a << 20);
+
+        assert_eq!(display_family_from_cpuid_eax(eax), 0x19);
+    }
+}
