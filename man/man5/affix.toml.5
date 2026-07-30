@@ -1,0 +1,296 @@
+.TH AFFIX.TOML 5 "2026-06-06" "affix 0.1.0" "File Formats"
+.SH NAME
+affix.toml \- affix process policy configuration
+.SH DESCRIPTION
+.B affix.toml
+is a TOML file that maps process image names or executable paths to CPU
+placement and process-mode policy.
+.PP
+On Linux, affix does not create the active configuration file automatically.
+The project install recipe installs an example at
+.B /usr/local/share/affix/affix.example.toml .
+Copy it to
+.B /etc/affix/affix.toml
+for the system service, or to the XDG user configuration path for a user-mode
+service.
+The user configuration path is
+.B $XDG_CONFIG_HOME/affix/affix.toml ,
+falling back to
+.B $HOME/.config/affix/affix.toml .
+Empty or relative XDG and
+.B HOME
+values are ignored; if no valid absolute user base exists, affix falls back to
+the Linux system path.
+.SH TOP-LEVEL SETTINGS
+.TP
+.BI heuristics " = true|false"
+Enable or disable database-backed heuristic classification.  If the field is
+omitted, the value defaults to
+.BR true .
+When the
+.B heuristics
+feature is not compiled, only built-in database-backed static defaults are
+available.
+.SH PROCESS RULES
+Each process rule is a TOML table.  The table name is the image selector.
+.PP
+On Linux, a selector that contains at least one
+.B /
+is matched as a full executable path against
+.BR /proc/ pid /exe .
+A selector without
+.B /
+is broad by design: it matches the truncated
+.BR /proc/ pid /comm
+name or the basename of
+.BR /proc/ pid /exe .
+.SH RULE FIELDS
+.TP
+.BI affinity " = " string
+Portable or numeric affinity expression.  Terms are separated with
+.BR + .
+Supported portable terms are:
+.RS
+.TP
+.B P
+Performance cores.
+.TP
+.B E
+Efficient cores.
+.TP
+.B LPE
+Low-power efficient cores.
+.TP
+.B LP-E
+Alias for
+.BR LPE .
+.TP
+.B C
+Cache-preferred core set.
+.TP
+.B X3D
+Alias for
+.BR C .
+.RE
+.IP
+Decimal numeric terms select logical processor indexes directly, for example
+.B "2+3" .
+.TP
+.BI affinity_mask " = " integer|string
+Explicit affinity bitmask.  The value may be a TOML integer, a decimal string,
+or a hexadecimal string with
+.B 0x
+or
+.B 0X
+prefix.  Zero is invalid.
+.TP
+.BI mode " = " string
+Process mode.  Valid values are:
+.RS
+.TP
+.B normal
+Do not request efficiency, performance, or realtime mode.  This is the default.  The alias
+.B none
+is also accepted.
+.TP
+.B efficiency
+Request efficiency mode.  If
+.B affinity
+and
+.B affinity_mask
+are omitted, affix assigns the portable affinity expression
+.BR E+LPE .
+.TP
+.B performance
+Request performance mode.  If
+.B affinity
+and
+.B affinity_mask
+are omitted, affix assigns the portable affinity expression
+.BR P+E+C .
+.TP
+.B realtime
+Request realtime mode.  If
+.B affinity
+and
+.B affinity_mask
+are omitted, affix assigns the portable affinity expression
+.BR P+C .
+.RE
+.SH TABLE FORMS
+The direct table form uses the selector as the table name:
+.PP
+.nf
+[systemd-journald]
+affinity = "E+LPE"
+mode = "efficiency"
+.fi
+.PP
+Full Linux executable paths must be quoted as TOML table names:
+.PP
+.nf
+["/usr/lib/systemd/systemd-journald"]
+affinity = "2+3"
+mode = "normal"
+.fi
+.SH POWER PROFILE TABLES
+Affix supports profile-specific rule tables for:
+.RS
+.TP
+.B efficiency
+Efficiency or power-saver profile.
+.TP
+.B balanced
+Balanced profile.
+.TP
+.B performance
+Performance profile.
+.RE
+.PP
+Profile-specific tables are partial overlays over the top-level rule for the
+same selector.  The active operating-system power profile selects one overlay.
+Fields present in the selected overlay override the top-level rule.  Fields
+missing from the selected overlay inherit from the top-level rule.  Fields still
+missing after that merge mean operating-system default behavior for that field,
+except that mode-specific affinity defaults can apply:
+.RS
+.TP
+.B mode = "efficiency"
+without
+.B affinity
+or
+.B affinity_mask
+supplies the default portable affinity
+.BR E+LPE .
+.TP
+.B mode = "performance"
+without
+.B affinity
+or
+.B affinity_mask
+supplies the default portable affinity
+.BR P+E+C .
+.TP
+.B mode = "realtime"
+without
+.B affinity
+or
+.B affinity_mask
+supplies the default portable affinity
+.BR P+C .
+.RE
+.PP
+For example:
+.PP
+.nf
+["game"]
+mode = "realtime"
+
+["game".performance]
+affinity = "P+E"
+.fi
+.PP
+In the
+.B performance
+profile, the effective rule is
+.B mode = "realtime"
+plus the
+.B affinity
+field from the overlay.
+In other profiles, the top-level rule still applies and only
+.B mode = "realtime"
+is requested.
+.PP
+Profile-specific-only rules are valid:
+.PP
+.nf
+[app.performance]
+affinity = "P"
+.fi
+.PP
+This does not create a default
+.B app
+rule.  If the active profile is not
+.B performance
+and no default rule exists, affix treats affinity for that rule family as
+operating-system default.
+.SH EFFECTIVE POLICY
+Affix distinguishes an absent matching rule family from an effective rule that
+resolves to operating-system default.
+.PP
+If a process has no matching rule family, affix ignores it.  It does not apply
+operating-system default policy to arbitrary unrelated processes.
+.PP
+If a process has a matching rule family but no effective affinity under the
+active profile, affinity is operating-system default for that process family.
+Untouched processes are left alone.  Processes previously moved by affix into an
+affix-owned cgroup may be moved back to their recorded origin.  Systemd units
+whose runtime
+.B AllowedCPUs=
+was changed by affix may be restored to their recorded original value.
+.PP
+This is not historical restoration of every pre-existing priority or affinity
+state.  Affix applies the policy that is effective now.  If no affinity remains
+effective, the intended state is operating-system default or the surrounding
+systemd envelope.
+.SH LINUX SELECTOR CONSEQUENCES
+Linux selectors without
+.B /
+are intentionally broad.  They match both
+.BR /proc/ pid /comm
+and the executable basename.  This can match processes in different systemd
+units, user managers, or session contexts.  Runtime enforcement is still bounded
+by ownership semantics: a broad selector does not allow affix to mutate a broad
+session scope blindly.
+.PP
+When a matching Linux process is contained by a specific service unit, affix may
+enforce affinity by changing that service unit's runtime
+.BR AllowedCPUs= .
+The service unit name does not need to match the executable name.  When a
+matching process is under desktop app or background lineage, app scopes and app
+slices require a unit-name match with the process identity; otherwise affix may
+fall back to an affix-owned cpuset cgroup.
+Processes only under broad session or manager scopes are skipped unless they
+meet one of those narrower criteria.
+.PP
+Use full executable path selectors when a broad basename would be ambiguous.
+Use systemd configuration directly when the intended policy is really for a
+whole slice, such as
+.BR background.slice ,
+rather than for a particular executable image.
+.SH EXAMPLES
+Broad Linux rule matching both system and user
+.B dbus-daemon
+instances:
+.PP
+.nf
+[dbus-daemon]
+affinity = "2+3"
+mode = "normal"
+.fi
+.PP
+Portable low-power rule for journald:
+.PP
+.nf
+[systemd-journald]
+affinity = "E+LPE"
+mode = "efficiency"
+.fi
+.SH FILES
+.TP
+.B /etc/affix/affix.toml
+Linux system service configuration.
+.TP
+.B $XDG_CONFIG_HOME/affix/affix.toml
+Linux user configuration path.  If
+.B XDG_CONFIG_HOME
+is unset, the fallback is
+.B $HOME/.config/affix/affix.toml .
+If neither base is valid and absolute, affix falls back to
+.B /etc/affix/affix.toml .
+.TP
+.B /usr/local/share/affix/affix.example.toml
+Linux example configuration installed by
+.B just install .
+.SH SEE ALSO
+.BR affix (8)

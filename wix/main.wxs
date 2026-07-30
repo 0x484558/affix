@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Affix"
+    Manufacturer="0x484558"
+    Version="$(var.Version)"
+    UpgradeCode="E5524B92-1EF5-4A69-B2D5-7A239CB5D3BF"
+    Scope="perMachine">
+    <SummaryInformation Description="Affix process policy service installer" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Affix is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="MainFeature" Title="Affix" Level="1">
+      <ComponentGroupRef Id="AffixComponents" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Affix" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="AffixComponents" Directory="INSTALLFOLDER">
+      <Component Id="AffixServiceComponent" Guid="3D866AD6-D3A1-492A-A395-1B0AC1F873A2" Bitness="always64">
+        <File Id="AffixExe" Source="$(var.CargoTargetBinDir)\affix.exe" KeyPath="yes" />
+        <ServiceInstall
+          Id="AffixServiceInstall"
+          Name="affix"
+          DisplayName="Affix Process Monitor"
+          Description="Enforces process affinity and efficiency policies."
+          Type="ownProcess"
+          Start="auto"
+          ErrorControl="normal" />
+        <ServiceControl
+          Id="AffixServiceControl"
+          Name="affix"
+          Start="install"
+          Stop="both"
+          Remove="uninstall"
+          Wait="yes" />
+      </Component>
+    </ComponentGroup>
+  </Package>
+</Wix>

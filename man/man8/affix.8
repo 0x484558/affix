@@ -1,0 +1,195 @@
+.TH AFFIX 8 "2026-06-06" "affix 0.1.0" "System Administration"
+.SH NAME
+affix \- CPU placement policy daemon
+.SH SYNOPSIS
+.B affix
+.SH DESCRIPTION
+.B affix
+is a CPU placement policy daemon.  On Linux it watches process creation events,
+listens for power-profile changes, and reconciles matching processes against
+the active policy in
+.BR affix.toml (5).
+.PP
+The Linux daemon is intended to run as a system service when cpuset enforcement
+is required.  The installed systemd system unit runs
+.B /usr/local/bin/affix
+as root by default, because creating cpuset cgroups, migrating processes, and
+adjusting systemd units require privileges on the cgroup hierarchy and D-Bus.
+.SH RUNTIME POLICY MODEL
+Affix reconciles only processes that match configured rule families.  A process
+with no matching rule family is ignored.  Affix does not apply
+operating-system-default policy to every process on the system.
+.PP
+If a matching rule family resolves to no effective affinity under the active
+power profile, affinity for that family is operating-system default.  Untouched
+processes are left alone.  Processes previously moved by affix into an
+affix-owned cgroup are moved back to their recorded origin cgroup when possible.
+Systemd units changed by affix are restored to the recorded original runtime
+.B AllowedCPUs=
+value.
+.PP
+The daemon does not preserve arbitrary historical process affinity or priority
+state.  Its model is to apply the policy that is effective now, or to return to
+operating-system default and the surrounding administrative envelope when no
+affix policy applies.
+.SH SYSTEMD TARGETING
+For concrete affinity rules, affix first uses systemd runtime
+.B AllowedCPUs=
+when the process maps to a specific systemd unit.  System services are adjusted
+through the system manager.  Service unit names do not need to match executable
+names; the containing service is already the ownership boundary.  Desktop app
+scopes under
+.B user@UID.service
+are adjusted through that user's systemd manager.
+.PP
+Affix connects to the user manager at
+.B /run/user/UID/bus
+when targeting a user app scope.  Systemd exposes
+.B AllowedCPUs
+on D-Bus as a byte-array CPU bitmap, not as the textual CPU list accepted by
+.BR systemctl (1).
+Affix converts its CPU mask and calls runtime
+.B SetUnitProperties .
+The change is not written to unit files.
+.PP
+For desktop app scopes and app slices, affix requires the unit name to match
+the process identity.  For example, a KDE Konsole process in
+.B app-org.kde.konsole-123.scope
+may cause affix to update that scope.  An unrelated program launched inside
+Konsole does not cause affix to update the whole Konsole scope.
+.PP
+Broad units such as
+.BR session-*.scope ,
+.BR user@UID.service ,
+and generic slices are not direct targets for image rules.  Mutating those units
+would affect processes that the rule did not identify.
+.SH AFFIX-OWNED CGROUP FALLBACK
+If a process is under a desktop app or background lineage but has no matching
+app-specific systemd unit of its own, affix may fall back to moving the process
+into an affix-owned cpuset cgroup.  This is the intended fallback for cases such
+as an application binary launched from a terminal app scope where the child did
+not receive its own app scope.
+.PP
+Affix-owned cgroups are allocated by normalized effective CPU mask.  Distinct
+rules that resolve to the same effective mask share the same cgroup.  Leaf
+cgroup names use the
+.B affix-
+prefix.
+.PP
+For affix-owned cpuset cgroups, affix intersects the requested CPU mask with the
+process origin cgroup's
+.B cpuset.cpus.effective
+and the process scheduler affinity mask.  If the intersection is empty, the rule
+cannot be enforced for that process.
+.SH SYSTEMD CPU ENVELOPES
+.B AllowedCPUs=
+and
+.B CPUAffinity=
+are different systemd mechanisms.
+.PP
+.B AllowedCPUs=
+is a cgroup v2 cpuset resource-control property.  Its effective value is limited
+by parent units and is reported by systemd as
+.BR EffectiveCPUs= .
+.PP
+.B CPUAffinity=
+is scheduler affinity inherited by processes launched by systemd.  A cpuset that
+allows CPUs
+.B 0-31
+does not make CPUs
+.B 0-15
+usable for a process that inherited scheduler affinity
+.BR 16-31 .
+The kernel schedules on the intersection of scheduler affinity, cpuset
+constraints, and online CPUs.  Affix respects that intersection instead of
+trying to undo administrative policy.
+.SH BROAD SLICE POLICY
+Some useful policies are slice policies rather than image policies.  For
+example, putting all of
+.B background.slice
+on efficient cores is better expressed directly through systemd:
+.PP
+.nf
+systemctl --user set-property --runtime background.slice AllowedCPUs=8-15
+.fi
+.PP
+Persist the same idea with a user-manager drop-in if it should survive
+restarts.  In that model affix has nothing to restore, because the administrator
+owns the slice policy.  Do not approximate broad slice policy with broad affix
+image selectors; that either affects no process because affix refuses broad
+ownership, or it unnecessarily moves processes away from useful systemd
+accounting when fallback ownership is permitted.
+.SH PROCESS TREE RECONCILIATION
+Affix resolves each process independently during subtree traversal.  A matched
+parent supplies an inherited target to descendants, but each child is checked
+against the rule set before that inherited target is used.  A child with its own
+applicable rule and its descendants use the child target.
+.PP
+Power-profile changes trigger reconciliation of the live process tree.  Affix
+does not poll for power mode in a loop; it reacts to the platform power-profile
+notification layer.
+.SH FAILURE AND RESTART BEHAVIOR
+If a systemd D-Bus update fails for a specific unit, affix logs the error.  If
+the process is eligible for affix-owned cgroup fallback, affix may still enforce
+the affinity through that fallback.  Otherwise the process is skipped.
+.PP
+Origin cgroups for moved processes and original systemd
+.B AllowedCPUs=
+values are kept in daemon memory.  If affix restarts, those records are lost.
+The daemon can still apply current policy, but it cannot restore placement or
+runtime unit state that only the previous daemon process knew.
+.SH COMMANDS
+.TP
+.B affix
+Run the daemon in the foreground.  Under systemd this is the command used by
+both the system and user unit files.
+.SH FILES
+.TP
+.B /etc/affix/affix.toml
+Linux system service configuration.  This file is not created automatically by
+the Linux daemon.
+.TP
+.B $XDG_CONFIG_HOME/affix/affix.toml
+Linux user-mode configuration path.  If
+.B XDG_CONFIG_HOME
+is unset, the fallback is
+.B $HOME/.config/affix/affix.toml .
+Relative or empty XDG paths are ignored.  If
+.B HOME
+is also unset, empty, or relative, affix falls back to the Linux system
+configuration path.
+.TP
+.B /var/lib/affix/applications.sqlite
+Linux system persistent decision database.
+.TP
+.B $XDG_STATE_HOME/affix/applications.sqlite
+Linux user-mode persistent decision database.  If
+.B XDG_STATE_HOME
+is unset, the fallback is
+.B $HOME/.local/state/affix/applications.sqlite .
+Relative or empty XDG paths are ignored.  If
+.B HOME
+is also unset, empty, or relative, affix falls back to the Linux system
+database path.
+.TP
+.B /usr/local/share/affix/affix.example.toml
+Linux example configuration installed by
+.B just install .
+Copy this file to
+.B /etc/affix/affix.toml
+to make it active for the system service.
+.TP
+.B /usr/local/lib/systemd/system/affix.service
+System service unit installed by
+.B just install .
+.SH CONFIGURATION
+See
+.BR affix.toml (5).
+.SH NOTES
+The Linux install recipe does not enable or start the systemd service.  Enable
+or start it explicitly with
+.BR systemctl (1).
+.SH SEE ALSO
+.BR affix.toml (5),
+.BR systemctl (1),
+.BR systemd.service (5)
